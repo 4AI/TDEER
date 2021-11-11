@@ -194,12 +194,23 @@ If you use our code in your research, please cite our work:
 
 
 ```bibtex
-@inproceedings{li2021tdeer,
-   title={TDEER: An Efficient Translating Decoding Schema for Joint Extraction of Entities and Relations},
-   author={Li, Xianming and Luo, Xiaotian and Dong, Chenghao and Yang, Daichuan and Luan, Beidi and He, Zhen},
-   booktitle={Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
-   year={2021}
+@inproceedings{li-etal-2021-tdeer,
+    title = "{TDEER}: An Efficient Translating Decoding Schema for Joint Extraction of Entities and Relations",
+    author = "Li, Xianming  and
+      Luo, Xiaotian  and
+      Dong, Chenghao  and
+      Yang, Daichuan  and
+      Luan, Beidi  and
+      He, Zhen",
+    booktitle = "Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing",
+    month = nov,
+    year = "2021",
+    address = "Online and Punta Cana, Dominican Republic",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2021.emnlp-main.635",
+    pages = "8055--8064",
 }
+
 ```
 
 ## Contact
