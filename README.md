@@ -27,6 +27,7 @@ You can install the required dependencies by the following script.
 pip install -r requirements.txt
 ```
 
+For tensorflow version, we recommend `tensorflow-gpu==1.15.0`.
 
 ### 2. Prepare Data
 
