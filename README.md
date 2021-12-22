@@ -21,13 +21,14 @@ TDEER is an efficient model for joint extraction of entities and relations. Unli
 
 We conducted experiments under python3.7 and used GPUs device to accelerate computing. 
 
-You can install the required dependencies by the following script.
+You should first prepare the tensorflow version in terms of your GPU environment. For tensorflow version, we recommend `tensorflow-gpu==1.15.0`.
+
+Then, you can install the other required dependencies by the following script.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For tensorflow version, we recommend `tensorflow-gpu==1.15.0`.
 
 ### 2. Prepare Data
 
