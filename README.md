@@ -221,6 +221,11 @@ If you use our code in your research, please cite our work:
 
 ```
 
+## Acknowledgment
+
+Some of our codes are inspired by [weizhepei/CasRel](https://github.com/weizhepei/CasRel). Thanks for their excellent work.
+
+
 ## Contact
 
 If you have any questions about the paper or code, you can
