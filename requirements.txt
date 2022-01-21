@@ -3,4 +3,4 @@ boltons
 Keras>=2.3.1
 tqdm
 click
-langml
+langml<0.2.0
