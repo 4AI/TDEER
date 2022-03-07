@@ -66,7 +66,6 @@ class Infer:
                 batch_sub_entities = []
                 batch_rel_types = []
                 for (sub, sub_head, sub_tail) in subjects:
-                    sub = self.decode_entity(text, mapping, sub_head, sub_tail)
                     for rel in relations:
                         batch_sub_heads.append([sub_head])
                         batch_sub_tails.append([sub_tail])
