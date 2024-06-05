@@ -1,6 +1,0 @@
-tokenizers
-boltons
-Keras==2.3.1
-tqdm
-click
-langml<0.2.0

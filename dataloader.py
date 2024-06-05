@@ -1,50 +1,52 @@
-#! -*- coding:utf-8 -*-
+# -*- coding:utf-8 -*-
 
 import json
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
 import numpy as np
-from keras.preprocessing.sequence import pad_sequences
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer
 
 import log
 
-
-def find_entity(source: List[int], target: List[int]) -> int:
+def find_entity(source, target):
+    """ Find the start index of the target sequence in the source sequence """
     target_len = len(target)
-    for i in range(len(source)):
-        if source[i: i + target_len] == target:
+    for i in range(len(source) - target_len + 1):
+        if source[i:i+target_len] == target:
             return i
     return -1
 
+def to_tuple(sent):
+    """ Convert lists to tuples in place """
+    sent['triple_list'] = [tuple(triple) for triple in sent['triple_list']]
 
-def to_tuple(sent: str):
-    """ list to tuple (inplace operation)
-    """
-    triple_list = []
-    for triple in sent['triple_list']:
-        triple_list.append(tuple(triple))
-    sent['triple_list'] = triple_list
-
-
-def filter_data(fpath: str, rel2id: Dict):
+def filter_data(fpath: str, rel2id: dict):
     filtered_data = []
-    for obj in json.load(open(fpath)):
-        filtered_triples = []
-        if 'NYT11-HRL' in fpath and len(obj['triple_list']) != 1:
+    try:
+        with open(fpath, 'r') as file:
+            data = json.load(file)
+    except FileNotFoundError:
+        print("File not found:", fpath)
+        return filtered_data
+    except json.JSONDecodeError:
+        print("Error decoding JSON from:", fpath)
+        return filtered_data
+
+    for obj in data:
+        if 'NYT11-HRL' in fpath and len(obj.get('triple_list', [])) != 1:
             continue
-        for triple in obj['triple_list']:
-            if triple[1] not in rel2id:
-                continue
-            filtered_triples.append(triple)
+        filtered_triples = [triple for triple in obj.get('triple_list', []) if triple[1] in rel2id]
         if not filtered_triples:
             continue
         obj['triple_list'] = filtered_triples
         filtered_data.append(obj)
+    
     return filtered_data
 
-
-def load_rel(rel_path: str) -> Tuple[Dict, Dict, List, int]:
+def load_rel(rel_path: str) -> Tuple[Dict, Dict, List]:
     id2rel, rel2id = json.load(open(rel_path))
     all_rels = list(id2rel.keys())
     id2rel = {int(i): j for i, j in id2rel.items()}
@@ -64,9 +66,8 @@ def load_data(fpath: str, rel2id: Dict, is_train: bool = False) -> List:
     log.info(f"data len: {len(data)}")
     return data
 
-
-class DataGenerator:
-    def __init__(self, datas: List, tokenizer: object, rel2id: Dict, all_rels: List, max_len: int,
+class DataGenerator(Dataset):
+    def __init__(self, datas: List, tokenizer: BertTokenizer, rel2id: Dict, all_rels: List, max_len: int,
                  batch_size: int = 32, max_sample_triples: Optional[int] = None, neg_samples: Optional[int] = None):
         self.max_sample_triples = max_sample_triples
         self.neg_samples = neg_samples
@@ -85,7 +86,7 @@ class DataGenerator:
             pos_datas = []
             neg_datas = []
 
-            text_tokened = tokenizer.encode(data['text'])
+            text_tokened = tokenizer.encode_plus(data['text'], truncation=True, padding='max_length', max_length=max_len)
             entity_set = set()  # (head idx, tail idx)
             triples_set = set()   # (sub head, sub tail, obj head, obj tail, rel)
             subj_rel_set = set()   # (sub head, sub tail, rel)
@@ -95,12 +96,12 @@ class DataGenerator:
             for triple in data['triple_list']:
                 subj, rel, obj = triple
                 rel_idx = self.rel2id[rel]
-                subj_tokened = tokenizer.encode(subj)
-                obj_tokened = tokenizer.encode(obj)
-                subj_head_idx = find_entity(text_tokened.ids, subj_tokened.ids[1:-1])
-                subj_tail_idx = subj_head_idx + len(subj_tokened.ids[1:-1]) - 1
-                obj_head_idx = find_entity(text_tokened.ids, obj_tokened.ids[1:-1])
-                obj_tail_idx = obj_head_idx + len(obj_tokened.ids[1:-1]) - 1
+                subj_tokened = tokenizer.encode_plus(subj, add_special_tokens=False)
+                obj_tokened = tokenizer.encode_plus(obj, add_special_tokens=False)
+                subj_head_idx = find_entity(text_tokened['input_ids'], subj_tokened['input_ids'])
+                subj_tail_idx = subj_head_idx + len(subj_tokened['input_ids']) - 1
+                obj_head_idx = find_entity(text_tokened['input_ids'], obj_tokened['input_ids'])
+                obj_tail_idx = obj_head_idx + len(obj_tokened['input_ids']) - 1
                 if subj_head_idx == -1 or obj_head_idx == -1:
                     continue
                 entity_set.add((subj_head_idx, subj_tail_idx, 0))
@@ -141,8 +142,8 @@ class DataGenerator:
                     sample_obj_heads[idx] = 1.0
                 # postive samples
                 pos_datas.append({
-                    'token_ids': text_tokened.ids,
-                    'segment_ids': text_tokened.type_ids,
+                    'token_ids': text_tokened['input_ids'],
+                    'segment_ids': text_tokened['token_type_ids'],
                     'entity_heads': entity_heads,
                     'entity_tails': entity_tails,
                     'rels': rels,
@@ -158,8 +159,8 @@ class DataGenerator:
                 neg_pair = (neg_subj_head_idx, neg_sub_tail_idx, rel_idx)
                 if neg_pair not in subj_rel_set and neg_pair not in neg_history:
                     current_neg_datas.append({
-                        'token_ids': text_tokened.ids,
-                        'segment_ids': text_tokened.type_ids,
+                        'token_ids': text_tokened['input_ids'],
+                        'segment_ids': text_tokened['token_type_ids'],
                         'entity_heads': entity_heads,
                         'entity_tails': entity_tails,
                         'rels': rels,
@@ -175,8 +176,8 @@ class DataGenerator:
                     neg_pair = (subj_head_idx, subj_tail_idx, neg_rel_idx)
                     if neg_pair not in subj_rel_set and neg_pair not in neg_history:
                         current_neg_datas.append({
-                            'token_ids': text_tokened.ids,
-                            'segment_ids': text_tokened.type_ids,
+                            'token_ids': text_tokened['input_ids'],
+                            'segment_ids': text_tokened['token_type_ids'],
                             'entity_heads': entity_heads,
                             'entity_tails': entity_tails,
                             'rels': rels,
@@ -192,8 +193,8 @@ class DataGenerator:
                     neg_pair = (neg_subj_head_idx, neg_sub_tail_idx, rel_idx)
                     if neg_pair not in subj_rel_set and neg_pair not in neg_history:
                         current_neg_datas.append({
-                            'token_ids': text_tokened.ids,
-                            'segment_ids': text_tokened.type_ids,
+                            'token_ids': text_tokened['input_ids'],
+                            'segment_ids': text_tokened['token_type_ids'],
                             'entity_heads': entity_heads,
                             'entity_tails': entity_tails,
                             'rels': rels,
@@ -211,54 +212,71 @@ class DataGenerator:
             current_datas = pos_datas + neg_datas
             self.datas.extend(current_datas)
 
-        self.steps = len(self.datas) // self.batch_size
-        if len(self.datas) % self.batch_size != 0:
-            self.steps += 1
-
     def __len__(self):
-        return self.steps
+        return len(self.datas)
 
-    def __iter__(self, random: bool = False):
-        idxs = list(range(len(self.datas)))
-        if random:
-            np.random.shuffle(idxs)
-        batch_tokens, batch_segments = [], []
-        batch_entity_heads, batch_entity_tails = [], []
-        batch_rels = []
-        batch_sample_subj_head, batch_sample_subj_tail = [], []
-        batch_sample_rel = []
-        batch_sample_obj_heads = []
+    def __getitem__(self, idx):
+        sample = self.datas[idx]
+    
+        return {
+            'token_ids': sample['token_ids'],
+            'segment_ids': sample['segment_ids'],
+            'entity_heads': sample['entity_heads'],
+            'entity_tails': sample['entity_tails'],
+            'rels': sample['rels'],
+            'sample_subj_head': sample['sample_subj_head'],
+            'sample_subj_tail': sample['sample_subj_tail'],
+            'sample_rel': sample['sample_rel'],
+            'sample_obj_heads': sample['sample_obj_heads']
+        }
+        
 
-        for idx in idxs:
-            obj = self.datas[idx]
-            batch_tokens.append(obj['token_ids'])
-            batch_segments.append(obj['segment_ids'])
-            batch_entity_heads.append(obj['entity_heads'])
-            batch_entity_tails.append(obj['entity_tails'])
-            batch_rels.append(obj['rels'])
-            batch_sample_subj_head.append(obj['sample_subj_head'])
-            batch_sample_subj_tail.append(obj['sample_subj_tail'])
-            batch_sample_rel.append(obj['sample_rel'])
-            batch_sample_obj_heads.append(obj['sample_obj_heads'])
-            if len(batch_tokens) == self.batch_size or idx == idxs[-1]:
-                batch_tokens = pad_sequences(batch_tokens, maxlen=self.max_len, padding='post', truncating='post')
-                batch_segments = pad_sequences(batch_segments, maxlen=self.max_len, padding='post', truncating='post')
-                batch_entity_heads = pad_sequences(batch_entity_heads, maxlen=self.max_len, value=np.zeros(2))
-                batch_entity_tails = pad_sequences(batch_entity_tails, maxlen=self.max_len, value=np.zeros(2))
-                batch_rels = np.array(batch_rels)
-                batch_sample_subj_head = np.array(batch_sample_subj_head)
-                batch_sample_subj_tail = np.array(batch_sample_subj_tail)
-                batch_sample_rel = np.array(batch_sample_rel)
-                batch_sample_obj_heads = np.array(batch_sample_obj_heads)
-                yield [batch_tokens, batch_segments, batch_entity_heads, batch_entity_tails, batch_rels, batch_sample_subj_head, batch_sample_subj_tail, batch_sample_rel, batch_sample_obj_heads], None
-                batch_tokens, batch_segments = [], []
-                batch_entity_heads, batch_entity_tails = [], []
-                batch_rels = []
-                batch_sample_subj_head, batch_sample_subj_tail = [], []
-                batch_sample_rel = []
-                batch_sample_obj_heads = []
+def collate_fn(batch):
+    print("Batch input:", batch)
+    batch_tokens = [item['token_ids'] for item in batch]
+    batch_attention_masks = [[1] * len(tokens) for tokens in batch_tokens]
+    batch_segments = [item['segment_ids'] for item in batch]
+    batch_entity_heads = [item['entity_heads'] for item in batch]
+    batch_entity_tails = [item['entity_tails'] for item in batch]
+    batch_rels = [item['rels'] for item in batch]
+    batch_sample_subj_head = [item['sample_subj_head'] for item in batch]
+    batch_sample_subj_tail = [item['sample_subj_tail'] for item in batch]
+    batch_sample_rel = [item['sample_rel'] for item in batch]
+    batch_sample_obj_heads = [item['sample_obj_heads'] for item in batch]
 
-    def forfit(self, random: bool = False):
-        while True:
-            for inputs, labels in self.__iter__(random=random):
-                yield inputs, labels
+    # Convert lists to NumPy arrays
+    batch_tokens_np = np.array(batch_tokens)
+    batch_attention_masks_np = np.array(batch_attention_masks)
+    batch_segments_np = np.array(batch_segments)
+    batch_entity_heads_np = np.array(batch_entity_heads)
+    batch_entity_tails_np = np.array(batch_entity_tails)
+    batch_rels_np = np.array(batch_rels)
+    batch_sample_subj_head_np = np.array(batch_sample_subj_head)
+    batch_sample_subj_tail_np = np.array(batch_sample_subj_tail)
+    batch_sample_rel_np = np.array(batch_sample_rel)
+    batch_sample_obj_heads_np = np.array(batch_sample_obj_heads)
+
+    # Convert NumPy arrays to PyTorch tensors
+    batch_tokens = torch.tensor(batch_tokens_np, dtype=torch.long)
+    batch_attention_masks = torch.tensor(batch_attention_masks_np, dtype=torch.long)
+    batch_segments = torch.tensor(batch_segments_np, dtype=torch.long)
+    batch_entity_heads = torch.tensor(batch_entity_heads_np, dtype=torch.float)
+    batch_entity_tails = torch.tensor(batch_entity_tails_np, dtype=torch.float)
+    batch_rels = torch.tensor(batch_rels_np, dtype=torch.float)
+    batch_sample_subj_head = torch.tensor(batch_sample_subj_head_np, dtype=torch.long)
+    batch_sample_subj_tail = torch.tensor(batch_sample_subj_tail_np, dtype=torch.long)
+    batch_sample_rel = torch.tensor(batch_sample_rel_np, dtype=torch.long)
+    batch_sample_obj_heads = torch.tensor(batch_sample_obj_heads_np, dtype=torch.float)
+
+    return {
+        'token_ids': batch_tokens,
+        'attention_mask': batch_attention_masks,
+        'segment_ids': batch_segments,
+        'entity_heads': batch_entity_heads,
+        'entity_tails': batch_entity_tails,
+        'rels': batch_rels,
+        'sample_subj_head': batch_sample_subj_head,
+        'sample_subj_tail': batch_sample_subj_tail,
+        'sample_rel': batch_sample_rel,
+        'sample_obj_heads': batch_sample_obj_heads
+    }
