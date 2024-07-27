@@ -1,14 +1,11 @@
-#! -*- coding:utf-8 -*-
-
 import json
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
 import numpy as np
-from keras.preprocessing.sequence import pad_sequences
-
-import log
-
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer
 
 def find_entity(source: List[int], target: List[int]) -> int:
     target_len = len(target)
@@ -17,15 +14,13 @@ def find_entity(source: List[int], target: List[int]) -> int:
             return i
     return -1
 
-
-def to_tuple(sent: str):
+def to_tuple(sent: dict):
     """ list to tuple (inplace operation)
     """
     triple_list = []
     for triple in sent['triple_list']:
         triple_list.append(tuple(triple))
     sent['triple_list'] = triple_list
-
 
 def filter_data(fpath: str, rel2id: Dict):
     filtered_data = []
@@ -43,34 +38,30 @@ def filter_data(fpath: str, rel2id: Dict):
         filtered_data.append(obj)
     return filtered_data
 
-
-def load_rel(rel_path: str) -> Tuple[Dict, Dict, List, int]:
+def load_rel(rel_path: str) -> Tuple[Dict, Dict, List]:
     id2rel, rel2id = json.load(open(rel_path))
     all_rels = list(id2rel.keys())
     id2rel = {int(i): j for i, j in id2rel.items()}
     return id2rel, rel2id, all_rels
 
-
 def load_data(fpath: str, rel2id: Dict, is_train: bool = False) -> List:
     data = filter_data(fpath, rel2id)
     if is_train:
         text_lens = [len(obj['text'].split()) for obj in data]
-        log.info("train text insight")
-        log.info(f" max len: {max(text_lens)}")
-        log.info(f" min len: {min(text_lens)}")
-        log.info(f" avg len: {sum(text_lens) / len(text_lens)}")
+        print("train text insight")
+        print(f" max len: {max(text_lens)}")
+        print(f" min len: {min(text_lens)}")
+        print(f" avg len: {sum(text_lens) / len(text_lens)}")
     for sent in data:
         to_tuple(sent)
-    log.info(f"data len: {len(data)}")
+    print(f"data len: {len(data)}")
     return data
 
-
-class DataGenerator:
-    def __init__(self, datas: List, tokenizer: object, rel2id: Dict, all_rels: List, max_len: int,
-                 batch_size: int = 32, max_sample_triples: Optional[int] = None, neg_samples: Optional[int] = None):
+class TDEERDataset(Dataset):
+    def __init__(self, datas: List, tokenizer: BertTokenizer, rel2id: Dict, all_rels: List, max_len: int,
+                 max_sample_triples: Optional[int] = None, neg_samples: Optional[int] = None):
         self.max_sample_triples = max_sample_triples
         self.neg_samples = neg_samples
-        self.batch_size = batch_size
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.rel2id = rel2id
@@ -85,7 +76,7 @@ class DataGenerator:
             pos_datas = []
             neg_datas = []
 
-            text_tokened = tokenizer.encode(data['text'])
+            text_tokened = tokenizer(data['text'], max_length=max_len, truncation=True, padding='max_length', return_tensors='pt')
             entity_set = set()  # (head idx, tail idx)
             triples_set = set()   # (sub head, sub tail, obj head, obj tail, rel)
             subj_rel_set = set()   # (sub head, sub tail, rel)
@@ -95,12 +86,12 @@ class DataGenerator:
             for triple in data['triple_list']:
                 subj, rel, obj = triple
                 rel_idx = self.rel2id[rel]
-                subj_tokened = tokenizer.encode(subj)
-                obj_tokened = tokenizer.encode(obj)
-                subj_head_idx = find_entity(text_tokened.ids, subj_tokened.ids[1:-1])
-                subj_tail_idx = subj_head_idx + len(subj_tokened.ids[1:-1]) - 1
-                obj_head_idx = find_entity(text_tokened.ids, obj_tokened.ids[1:-1])
-                obj_tail_idx = obj_head_idx + len(obj_tokened.ids[1:-1]) - 1
+                subj_tokened = tokenizer(subj, add_special_tokens=False)
+                obj_tokened = tokenizer(obj, add_special_tokens=False)
+                subj_head_idx = find_entity(text_tokened.input_ids[0].tolist(), subj_tokened.input_ids)
+                subj_tail_idx = subj_head_idx + len(subj_tokened.input_ids) - 1
+                obj_head_idx = find_entity(text_tokened.input_ids[0].tolist(), obj_tokened.input_ids)
+                obj_tail_idx = obj_head_idx + len(obj_tokened.input_ids) - 1
                 if subj_head_idx == -1 or obj_head_idx == -1:
                     continue
                 entity_set.add((subj_head_idx, subj_tail_idx, 0))
@@ -116,13 +107,13 @@ class DataGenerator:
             if not rel_set:
                 continue
 
-            entity_heads = np.zeros((self.max_len, 2))
-            entity_tails = np.zeros((self.max_len, 2))
+            entity_heads = torch.zeros((self.max_len, 2))
+            entity_tails = torch.zeros((self.max_len, 2))
             for (head, tail, _type) in entity_set:
                 entity_heads[head][_type] = 1
                 entity_tails[tail][_type] = 1
 
-            rels = np.zeros(self.relation_size)
+            rels = torch.zeros(self.relation_size)
             for idx in rel_set:
                 rels[idx] = 1
 
@@ -136,129 +127,97 @@ class DataGenerator:
             neg_history = set()
             for subj_head_idx, subj_tail_idx, obj_head_idx, obj_tail_idx, rel_idx in triples_list:
                 current_neg_datas = []
-                sample_obj_heads = np.zeros(self.max_len)
+                sample_obj_heads = torch.zeros(self.max_len)
                 for idx in trans_map[(subj_head_idx, subj_tail_idx, rel_idx)]:
                     sample_obj_heads[idx] = 1.0
-                # postive samples
+                # positive samples
                 pos_datas.append({
-                    'token_ids': text_tokened.ids,
-                    'segment_ids': text_tokened.type_ids,
+                    'token_ids': text_tokened.input_ids[0],
+                    'attention_mask': text_tokened.attention_mask[0],
                     'entity_heads': entity_heads,
                     'entity_tails': entity_tails,
                     'rels': rels,
-                    'sample_subj_head': subj_head_idx,
-                    'sample_subj_tail': subj_tail_idx,
-                    'sample_rel': rel_idx,
+                    'sample_subj_head': torch.tensor(subj_head_idx, dtype=torch.long),
+                    'sample_subj_tail': torch.tensor(subj_tail_idx, dtype=torch.long),
+                    'sample_rel': torch.tensor(rel_idx, dtype=torch.long),
                     'sample_obj_heads': sample_obj_heads,
                 })
 
-                # 1. inverse (tail as subj)
-                neg_subj_head_idx = obj_head_idx
-                neg_sub_tail_idx = obj_tail_idx
-                neg_pair = (neg_subj_head_idx, neg_sub_tail_idx, rel_idx)
-                if neg_pair not in subj_rel_set and neg_pair not in neg_history:
-                    current_neg_datas.append({
-                        'token_ids': text_tokened.ids,
-                        'segment_ids': text_tokened.type_ids,
-                        'entity_heads': entity_heads,
-                        'entity_tails': entity_tails,
-                        'rels': rels,
-                        'sample_subj_head': neg_subj_head_idx,
-                        'sample_subj_tail': neg_sub_tail_idx,
-                        'sample_rel': rel_idx,
-                        'sample_obj_heads': np.zeros(self.max_len),  # set 0 for negative samples
-                    })
-                    neg_history.add(neg_pair)
-
-                # 2. (pos sub, neg_rel)
-                for neg_rel_idx in rel_set - {rel_idx}:
-                    neg_pair = (subj_head_idx, subj_tail_idx, neg_rel_idx)
-                    if neg_pair not in subj_rel_set and neg_pair not in neg_history:
+                # Generate negative samples
+                if self.neg_samples:
+                    for _ in range(self.neg_samples):
+                        neg_rel = np.random.choice(self.rels_set)
+                        if neg_rel == rel_idx:
+                            continue
+                        if (subj_head_idx, subj_tail_idx, neg_rel) in neg_history:
+                            continue
+                        neg_history.add((subj_head_idx, subj_tail_idx, neg_rel))
+                        
+                        neg_sample_obj_heads = torch.zeros(self.max_len)
+                        for idx in trans_map.get((subj_head_idx, subj_tail_idx, neg_rel), []):
+                            neg_sample_obj_heads[idx] = 1.0
+                        
                         current_neg_datas.append({
-                            'token_ids': text_tokened.ids,
-                            'segment_ids': text_tokened.type_ids,
+                            'token_ids': text_tokened.input_ids[0],
+                            'attention_mask': text_tokened.attention_mask[0],
                             'entity_heads': entity_heads,
                             'entity_tails': entity_tails,
                             'rels': rels,
-                            'sample_subj_head': subj_head_idx,
-                            'sample_subj_tail': subj_tail_idx,
-                            'sample_rel': neg_rel_idx,
-                            'sample_obj_heads': np.zeros(self.max_len),  # set 0 for negative samples
+                            'sample_subj_head': torch.tensor(subj_head_idx, dtype=torch.long),
+                            'sample_subj_tail': torch.tensor(subj_tail_idx, dtype=torch.long),
+                            'sample_rel': torch.tensor(neg_rel, dtype=torch.long),
+                            'sample_obj_heads': neg_sample_obj_heads,
                         })
-                        neg_history.add(neg_pair)
 
-                # 3. (neg sub, pos rel)
-                for (neg_subj_head_idx, neg_sub_tail_idx) in subj_set - {(subj_head_idx, subj_tail_idx)}:
-                    neg_pair = (neg_subj_head_idx, neg_sub_tail_idx, rel_idx)
-                    if neg_pair not in subj_rel_set and neg_pair not in neg_history:
-                        current_neg_datas.append({
-                            'token_ids': text_tokened.ids,
-                            'segment_ids': text_tokened.type_ids,
-                            'entity_heads': entity_heads,
-                            'entity_tails': entity_tails,
-                            'rels': rels,
-                            'sample_subj_head': neg_subj_head_idx,
-                            'sample_subj_tail': neg_sub_tail_idx,
-                            'sample_rel': rel_idx,
-                            'sample_obj_heads': np.zeros(self.max_len),  # set 0 for negative samples
-                        })
-                        neg_history.add(neg_pair)
+                neg_datas.extend(current_neg_datas)
 
-                np.random.shuffle(current_neg_datas)
-                if self.neg_samples is not None:
-                    current_neg_datas = current_neg_datas[:self.neg_samples]
-                neg_datas += current_neg_datas
             current_datas = pos_datas + neg_datas
             self.datas.extend(current_datas)
 
-        self.steps = len(self.datas) // self.batch_size
-        if len(self.datas) % self.batch_size != 0:
-            self.steps += 1
+        print(f"Total number of samples: {len(self.datas)}")
+        print(f"Number of positive samples: {len(pos_datas)}")
+        print(f"Number of negative samples: {len(neg_datas)}")
 
     def __len__(self):
-        return self.steps
+        return len(self.datas)
 
-    def __iter__(self, random: bool = False):
-        idxs = list(range(len(self.datas)))
-        if random:
-            np.random.shuffle(idxs)
-        batch_tokens, batch_segments = [], []
-        batch_entity_heads, batch_entity_tails = [], []
-        batch_rels = []
-        batch_sample_subj_head, batch_sample_subj_tail = [], []
-        batch_sample_rel = []
-        batch_sample_obj_heads = []
+    def __getitem__(self, idx):
+        item = self.datas[idx]
+        required_keys = ['token_ids', 'attention_mask', 'entity_heads', 'entity_tails', 'rels', 'sample_subj_head', 'sample_subj_tail', 'sample_rel', 'sample_obj_heads']
+        for key in required_keys:
+            assert key in item, f"Required key '{key}' not found in item at index {idx}"
+        return item
 
-        for idx in idxs:
-            obj = self.datas[idx]
-            batch_tokens.append(obj['token_ids'])
-            batch_segments.append(obj['segment_ids'])
-            batch_entity_heads.append(obj['entity_heads'])
-            batch_entity_tails.append(obj['entity_tails'])
-            batch_rels.append(obj['rels'])
-            batch_sample_subj_head.append(obj['sample_subj_head'])
-            batch_sample_subj_tail.append(obj['sample_subj_tail'])
-            batch_sample_rel.append(obj['sample_rel'])
-            batch_sample_obj_heads.append(obj['sample_obj_heads'])
-            if len(batch_tokens) == self.batch_size or idx == idxs[-1]:
-                batch_tokens = pad_sequences(batch_tokens, maxlen=self.max_len, padding='post', truncating='post')
-                batch_segments = pad_sequences(batch_segments, maxlen=self.max_len, padding='post', truncating='post')
-                batch_entity_heads = pad_sequences(batch_entity_heads, maxlen=self.max_len, value=np.zeros(2))
-                batch_entity_tails = pad_sequences(batch_entity_tails, maxlen=self.max_len, value=np.zeros(2))
-                batch_rels = np.array(batch_rels)
-                batch_sample_subj_head = np.array(batch_sample_subj_head)
-                batch_sample_subj_tail = np.array(batch_sample_subj_tail)
-                batch_sample_rel = np.array(batch_sample_rel)
-                batch_sample_obj_heads = np.array(batch_sample_obj_heads)
-                yield [batch_tokens, batch_segments, batch_entity_heads, batch_entity_tails, batch_rels, batch_sample_subj_head, batch_sample_subj_tail, batch_sample_rel, batch_sample_obj_heads], None
-                batch_tokens, batch_segments = [], []
-                batch_entity_heads, batch_entity_tails = [], []
-                batch_rels = []
-                batch_sample_subj_head, batch_sample_subj_tail = [], []
-                batch_sample_rel = []
-                batch_sample_obj_heads = []
+def collate_fn(batch):
+    def stack_or_pad(key):
+        values = [d[key] for d in batch]
+        if isinstance(values[0], torch.Tensor):
+            return torch.stack(values)
+        elif isinstance(values[0], (int, np.int64)):
+            return torch.tensor(values, dtype=torch.long)
+        elif isinstance(values[0], list):
+            max_len = max(len(v) for v in values)
+            return torch.tensor([v + [0] * (max_len - len(v)) for v in values])
+        else:
+            print(f"Warning: Unexpected type in collate_fn for {key}: {type(values[0])}")
+            return values
 
-    def forfit(self, random: bool = False):
-        while True:
-            for inputs, labels in self.__iter__(random=random):
-                yield inputs, labels
+    result = {}
+    for key in batch[0].keys():
+        try:
+            result[key] = stack_or_pad(key)
+        except Exception as e:
+            print(f"Error processing {key}: {e}")
+            result[key] = [d[key] for d in batch]  # 退回到简单的列表
+    
+    # 确保 'token_ids' 存在
+    if 'token_ids' not in result:
+        print("Warning: 'token_ids' not found in batch. Keys present:", result.keys())
+        if 'input_ids' in result:
+            result['token_ids'] = result['input_ids']
+            print("Using 'input_ids' as 'token_ids'")
+    
+    return result
+
+def get_dataloader(dataset: TDEERDataset, batch_size: int, shuffle: bool = True) -> DataLoader:
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)

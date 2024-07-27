@@ -1,13 +1,10 @@
-#! -*- coding:utf-8 -*-
-
 import json
 import time
 from typing import Dict, List, Set
 
 import numpy as np
+import torch
 from tqdm import tqdm
-from langml.tensor_typing import Models
-
 
 def rematch(offsets: List) -> List:
     mapping = []
@@ -18,15 +15,12 @@ def rematch(offsets: List) -> List:
             mapping.append([i for i in range(offset[0], offset[1])])
     return mapping
 
-
 class Infer:
-    def __init__(self, entity_model: Models, rel_model: Models, translate_mdoel: Models,
-                 tokenizer: object, id2rel: Dict):
-        self.entity_model = entity_model
-        self.rel_model = rel_model
-        self.translate_model = translate_mdoel
+    def __init__(self, model: torch.nn.Module, tokenizer, id2rel: Dict, device: str):
+        self.model = model
         self.tokenizer = tokenizer
         self.id2rel = id2rel
+        self.device = device
 
     def decode_entity(self, text: str, mapping: List, start: int, end: int):
         s = mapping[start]
@@ -36,67 +30,84 @@ class Infer:
         entity = text[s: e + 1]
         return entity
 
-    def __call__(self, text: str, threshold: float = 0.5) -> Set:
-        tokened = self.tokenizer.encode(text)
-        token_ids, segment_ids = np.array([tokened.ids]), np.array([tokened.type_ids])
-        mapping = rematch(tokened.offsets)
-        entity_heads_logits, entity_tails_logits = self.entity_model.predict([token_ids, segment_ids])
-        entity_heads, entity_tails = np.where(entity_heads_logits[0] > threshold), np.where(entity_tails_logits[0] > threshold)
-        subjects = []
-        entity_map = {}
-        for head, head_type in zip(*entity_heads):
-            for tail, tail_type in zip(*entity_tails):
-                if head <= tail and head_type == tail_type:
-                    entity = self.decode_entity(text, mapping, head, tail)
-                    if head_type == 0:
-                        subjects.append((entity, head, tail))
-                    else:
-                        entity_map[head] = entity
-                    break
+    def __call__(self, text: str, threshold: float = 0.01) -> Set:  # MODIFIED: changed threshold from 0.1 to 0.01
+        self.model.eval()
+        with torch.no_grad():
+            tokened = self.tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512, return_offsets_mapping=True)
+            tokened = {k: v.to(self.device) for k, v in tokened.items()}
+            
+            entity_heads_logits, entity_tails_logits, relations_logits = self.model(tokened['input_ids'], tokened['attention_mask'])
 
-        triple_set = set()
-        if subjects:
-            # translating decoding
-            relations_logits = self.rel_model.predict([token_ids, segment_ids])
-            relations = np.where(relations_logits[0] > threshold)[0].tolist()
-            if relations:
-                batch_sub_heads = []
-                batch_sub_tails = []
-                batch_rels = []
-                batch_sub_entities = []
-                batch_rel_types = []
+            # print(f"Max entity_heads_logits: {entity_heads_logits.max().item()}")
+            # print(f"Max entity_tails_logits: {entity_tails_logits.max().item()}")
+            # print(f"Max relations_logits: {relations_logits.max().item()}")
+            entity_heads_probs = torch.sigmoid(entity_heads_logits)
+            entity_tails_probs = torch.sigmoid(entity_tails_logits)
+            relations_probs = torch.sigmoid(relations_logits)
+
+            entity_heads = torch.where(entity_heads_logits[0] > threshold)
+            entity_tails = torch.where(entity_tails_logits[0] > threshold)
+            relations = torch.where(relations_logits[0] > threshold)[0].tolist()
+
+            # print(f"Number of entity heads: {len(entity_heads[0])}")
+            # print(f"Number of entity tails: {len(entity_tails[0])}")
+            # print(f"Number of relations: {len(relations)}")
+
+            subjects = []
+            entity_map = {}
+            for head, head_type in zip(*entity_heads):
+                for tail, tail_type in zip(*entity_tails):
+                    if head <= tail and head_type == tail_type:
+                        entity = self.decode_entity(text, tokened['offset_mapping'][0].tolist(), head, tail)
+                        if head_type == 0:
+                            subjects.append((entity, head.item(), tail.item()))
+                        else:
+                            entity_map[head.item()] = entity
+                        break
+
+            # print(f"Number of subjects: {len(subjects)}")
+            # print(f"Number of entities in entity_map: {len(entity_map)}")
+
+            triple_set = set()
+            if subjects and relations:
                 for (sub, sub_head, sub_tail) in subjects:
-                    sub = self.decode_entity(text, mapping, sub_head, sub_tail)
                     for rel in relations:
-                        batch_sub_heads.append([sub_head])
-                        batch_sub_tails.append([sub_tail])
-                        batch_rels.append([rel])
-                        batch_sub_entities.append(sub)
-                        batch_rel_types.append(self.id2rel[rel])
+                        sub_head_tensor = torch.tensor([sub_head], device=self.device)
+                        sub_tail_tensor = torch.tensor([sub_tail], device=self.device)
+                        rel_tensor = torch.tensor([rel], device=self.device)
+                        
+                        _, _, _, obj_head_logits = self.model(
+                            tokened['input_ids'], 
+                            tokened['attention_mask'],
+                            sample_subj_head=sub_head_tensor,
+                            sample_subj_tail=sub_tail_tensor,
+                            sample_rel=rel_tensor
+                        )
+                        
+                        # print(f"Max obj_head_logits: {obj_head_logits.max().item()}")
+                        # print(f"Min obj_head_logits: {obj_head_logits.min().item()}")
+                        # print(f"Mean obj_head_logits: {obj_head_logits.mean().item()}")
+                        
+                        for h in torch.where(obj_head_logits[0] > threshold)[0].tolist():  # MODIFIED: changed threshold from 0.1 to 0.01
+                            if h in entity_map:
+                                obj = entity_map[h]
+                                triple_set.add((sub, self.id2rel[rel], obj))
+                            # print(f"Predicted object head: {h}")
+                            # print(f"Object in entity_map: {h in entity_map}")
 
-                batch_token_ids = np.repeat(token_ids, len(subjects) * len(relations), 0)
-                batch_segment_ids = np.zeros_like(batch_token_ids)
-                obj_head_logits = self.translate_model.predict_on_batch([
-                    batch_token_ids, batch_segment_ids, np.array(batch_sub_heads), np.array(batch_sub_tails), np.array(batch_rels)
-                ])
-                for sub, rel, obj_head_logit in zip(batch_sub_entities, batch_rel_types, obj_head_logits):
-                    for h in np.where(obj_head_logit > threshold)[0].tolist():
-                        if h in entity_map:
-                            obj = entity_map[h]
-                            triple_set.add((sub, rel, obj))
+            print(f"Number of triples: {len(triple_set)}")
+            print(f"Triples: {triple_set}")
+        
         return triple_set
-
 
 def partial_match(pred_set, gold_set):
     pred = {(i[0].split(' ')[0] if len(i[0].split(' ')) > 0 else i[0], i[1], i[2].split(' ')[0] if len(i[2].split(' ')) > 0 else i[2]) for i in pred_set}
     gold = {(i[0].split(' ')[0] if len(i[0].split(' ')) > 0 else i[0], i[1], i[2].split(' ')[0] if len(i[2].split(' ')) > 0 else i[2]) for i in gold_set}
     return pred, gold
 
-
 def remove_space(data_set):
     data_set = {(i[0].replace(' ', ''), i[1], i[2].replace(' ', '')) for i in data_set}
     return data_set
-
 
 def compute_metrics(infer, dev_data, exact_match=False, model_name='tmp'):
     output_path = f'{model_name}.output'

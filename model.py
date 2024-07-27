@@ -1,152 +1,117 @@
-# -*- coding:utf-8 -*-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import BertModel, BertConfig
 
-import os
-from typing import List, Tuple
+class SelfAttention(nn.Module):
+    def __init__(self, input_size, is_residual=True, attention_activation='relu'):
+        super(SelfAttention, self).__init__()
+        self.is_residual = is_residual
+        self.attention = nn.Linear(input_size, 1)
+        self.activation = nn.ReLU() if attention_activation == 'relu' else nn.Tanh()
 
-import tensorflow as tf
-import keras.layers as L
-import keras.backend as K
-from keras.models import Model
-from keras.callbacks import Callback
-from keras.optimizers import Adam
-from langml.plm.bert import load_bert
-from langml.layers import SelfAttention
-from langml.tensor_typing import Models
+    def forward(self, inputs):
+        attention_weights = self.activation(self.attention(inputs))
+        attention_weights = F.softmax(attention_weights, dim=1)
+        attended = torch.sum(inputs * attention_weights, dim=1)
+        if self.is_residual:
+            outputs = inputs + attended.unsqueeze(1)
+        else:
+            outputs = attended.unsqueeze(1)
+        return outputs
+        
+class TDEER(nn.Module):
+    def __init__(self, bert_model_name, relation_size):
+        super(TDEER, self).__init__()
+        self.bert = BertModel.from_pretrained(bert_model_name)
+        self.relation_size = relation_size
+        
+        hidden_size = self.bert.config.hidden_size
+        
+        self.entity_heads = nn.Linear(hidden_size, 2)
+        self.entity_tails = nn.Linear(hidden_size, 2)
+        self.rel_classifier = nn.Linear(hidden_size, relation_size)
+        
+        self.sub_head_feature = nn.Linear(hidden_size, hidden_size)
+        self.sub_tail_feature = nn.Linear(hidden_size, hidden_size)
+        self.rel_feature = nn.Embedding(relation_size, hidden_size)
+        self.rel_feature_dense = nn.Linear(hidden_size, hidden_size)
+        
+        # MODIFIED: Enhanced obj_feature
+        self.obj_feature = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        self.self_attention = nn.Linear(hidden_size, 1)
+        self.pred_obj_head = nn.Linear(hidden_size, 1)
 
-from utils import compute_metrics
+    def forward(self, input_ids, attention_mask, entity_heads=None, entity_tails=None, rels=None, 
+                sample_subj_head=None, sample_subj_tail=None, sample_rel=None, sample_obj_heads=None):
+        bert_output = self.bert(input_ids, attention_mask=attention_mask)
+        sequence_output = bert_output.last_hidden_state
+        pooled_output = bert_output.pooler_output
+    
+        pred_entity_heads = self.entity_heads(sequence_output)
+        pred_entity_tails = self.entity_tails(sequence_output)
+        pred_rels = self.rel_classifier(pooled_output)
+    
+        if sample_subj_head is not None and sample_subj_tail is not None and sample_rel is not None:
+            batch_size, seq_len = input_ids.size()
+            
+            sub_head_feature = self.sub_head_feature(sequence_output[torch.arange(batch_size), sample_subj_head])
+            sub_tail_feature = self.sub_tail_feature(sequence_output[torch.arange(batch_size), sample_subj_tail])
+            sub_feature = (sub_head_feature + sub_tail_feature) / 2
+    
+            rel_feature = self.rel_feature(sample_rel)
+            rel_feature = F.relu(self.rel_feature_dense(rel_feature))
+    
+            obj_feature_input = torch.cat([sequence_output, 
+                                           sub_feature.unsqueeze(1).expand(-1, seq_len, -1), 
+                                           rel_feature.unsqueeze(1).expand(-1, seq_len, -1)], dim=-1)
+            obj_feature = self.obj_feature(obj_feature_input)
+    
+            # attention_weights = F.softmax(self.self_attention(obj_feature), dim=1)
+            # attended_obj_feature = (obj_feature * attention_weights).sum(dim=1)
+            
+            # 修改这里
+            pred_obj_head = self.pred_obj_head(obj_feature).squeeze(-1)
+    
+            # 添加调试信息
+            # print(f"Debug - pred_obj_head shape: {pred_obj_head.shape}")
+            # print(f"Debug - attention_mask shape: {attention_mask.shape}")
+    
+            return pred_entity_heads, pred_entity_tails, pred_rels, pred_obj_head
+    
+        return pred_entity_heads, pred_entity_tails, pred_rels
 
-
-def build_model(bert_dir: str, learning_rate: float, relation_size: int) -> Tuple[Models, Models, Models, Models]:
-
-    def gather_span(x):
-        seq, idxs = x
-        idxs = K.cast(idxs, 'int32')
-        if len(K.int_shape(idxs)) == 3:
-            res = []
-            for i in range(len(K.int_shape(idxs))):
-                batch_idxs = K.arange(0, K.shape(seq)[0])
-                batch_idxs = K.expand_dims(batch_idxs, 1)
-                indices = K.concatenate([batch_idxs, idxs[:, i, :]], 1)
-                res.append(K.expand_dims(tf.gather_nd(seq, indices), 1))
-            return K.concatenate(res, 1)
-        batch_idxs = K.arange(0, K.shape(seq)[0])
-        batch_idxs = K.expand_dims(batch_idxs, 1)
-        idxs = K.concatenate([batch_idxs, idxs], 1)
-        return tf.gather_nd(seq, idxs)
-
-    bert_model, _ = load_bert(
-        config_path=os.path.join(bert_dir, 'bert_config.json'),
-        checkpoint_path=os.path.join(bert_dir, 'bert_model.ckpt'),
-    )
-
-    # entities in
-    gold_entity_heads_in = L.Input(shape=(None, 2), name='gold_entity_heads')
-    gold_entity_tails_in = L.Input(shape=(None, 2), name='gold_entity_tails')
-    gold_rels_in = L.Input(shape=(relation_size, ), name='gold_rels')
-    # pos sample
-    sub_head_in = L.Input(shape=(1,), name='sample_subj_head')
-    sub_tail_in = L.Input(shape=(1,), name='sample_subj_tail')
-    rel_in = L.Input(shape=(1,), name='sample_rel')
-    gold_obj_head_in = L.Input(shape=(None, ), name='sample_obj_heads')
-
-    gold_entity_heads, gold_entity_tails, sub_head, sub_tail, rel, gold_rels, gold_obj_head = gold_entity_heads_in, gold_entity_tails_in, sub_head_in, sub_tail_in, rel_in, gold_rels_in, gold_obj_head_in
-    mask = L.Lambda(lambda x: K.cast(K.greater(K.expand_dims(x, 2), 0), 'float32'))(bert_model.input[0])
-
-    tokens_feature = bert_model.output
-
-    # predict relations
-    pred_rels = L.Lambda(lambda x: x[:, 0])(tokens_feature)
-    pred_rels = L.Dense(relation_size, activation='sigmoid', name='pred_rel')(pred_rels)
-    rel_model = Model(bert_model.input, [pred_rels])
-
-    # predict entity
-    pred_entity_heads = L.Dense(2, activation='sigmoid', name='entity_heads')(tokens_feature)
-    pred_entity_tails = L.Dense(2, activation='sigmoid', name='entity_tails')(tokens_feature)
-    entity_model = Model(bert_model.input, [pred_entity_heads, pred_entity_tails])
-
-    # predict object
-    tokens_feature_size = K.int_shape(tokens_feature)[-1]
-    sub_head_feature = L.Lambda(gather_span)([tokens_feature, sub_head])
-    sub_head_feature = L.Lambda(lambda x: K.expand_dims(x, 1))(sub_head_feature)
-    sub_tail_feature = L.Lambda(gather_span)([tokens_feature, sub_tail])
-    sub_tail_feature = L.Lambda(lambda x: K.expand_dims(x, 1))(sub_tail_feature)
-    sub_feature = L.Average()([sub_head_feature, sub_tail_feature])
-
-    rel_feature = L.Embedding(relation_size, tokens_feature_size)(rel)
-    rel_feature = L.Dense(tokens_feature_size, activation='relu')(rel_feature)
-
-    obj_feature = L.Add()([tokens_feature, sub_feature, rel_feature])
-
-    value = SelfAttention(is_residual=True, attention_activation='relu')(obj_feature)
-
-    pred_obj_head = L.Dense(1, activation='sigmoid', name='pred_obj_head')(value)
-
-    translate_model = Model((*bert_model.input, sub_head_in, sub_tail_in, rel_in), [pred_obj_head])
-
-    train_model = Model(inputs=(*bert_model.input, gold_entity_heads_in, gold_entity_tails_in, gold_rels_in, sub_head_in, sub_tail_in, rel_in, gold_obj_head_in),
-                        outputs=[pred_entity_heads, pred_entity_tails, pred_rels, pred_obj_head])
-
-    # entity loss
-    entity_heads_loss = K.sum(K.binary_crossentropy(gold_entity_heads, pred_entity_heads), 2, keepdims=True)
-    entity_heads_loss = K.sum(entity_heads_loss * mask) / K.sum(mask)
-    entity_tails_loss = K.sum(K.binary_crossentropy(gold_entity_tails, pred_entity_tails), 2, keepdims=True)
-    entity_tails_loss = K.sum(entity_tails_loss * mask) / K.sum(mask)
-
-    # rel loss
-    rel_loss = K.mean(K.binary_crossentropy(gold_rels, pred_rels))
-
-    # obj loss
-    gold_obj_head = K.expand_dims(gold_obj_head, 2)
-    obj_head_loss = K.binary_crossentropy(gold_obj_head, pred_obj_head)
-    obj_head_loss = K.sum(obj_head_loss * mask) / K.sum(mask)
-
-    # joint loss
-    loss = (entity_heads_loss + entity_tails_loss) + rel_loss + 5.0 * obj_head_loss
-
-    train_model.add_loss(loss)
-    train_model.compile(optimizer=Adam(learning_rate))
-    train_model.summary()
-
-    return entity_model, rel_model, translate_model, train_model
-
-
-class Evaluator(Callback):
-    def __init__(self,
-                 infer: object,
-                 train_model: Models,
-                 dev_data: List,
-                 save_weights_path: str,
-                 model_name: str,
-                 learning_rate: float = 5e-5,
-                 min_learning_rate: float = 5e-6):
-        self.infer = infer
-        self.train_model = train_model
+class Evaluator:
+    def __init__(self, model, dev_data, tokenizer, id2rel, device):
+        self.model = model
         self.dev_data = dev_data
-        self.save_weights_path = save_weights_path
-        self.model_name = model_name
-        self.learning_rate = learning_rate
-        self.min_learning_rate = min_learning_rate
-        self.passed = 0
-        self.is_exact_match = True if self.model_name.startswith('NYT11-HRL') else False
+        self.tokenizer = tokenizer
+        self.id2rel = id2rel
+        self.device = device
+        self.best_f1 = float('-inf')
 
-    def on_train_begin(self, logs=None):
-        self.best = float('-inf')
+    def evaluate(self, epoch):
+        self.model.eval()
+        # Implement evaluation logic here
+        # Use the compute_metrics function from utils.py
+        precision, recall, f1 = compute_metrics(self.model, self.dev_data, self.tokenizer, self.id2rel, self.device)
+        
+        if f1 > self.best_f1:
+            self.best_f1 = f1
+            torch.save(self.model.state_dict(), f'best_model_epoch_{epoch}.pt')
+            print("New best model saved!")
+        
+        print(f'Epoch {epoch}: F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, Best F1: {self.best_f1:.4f}\n')
+        
+        return f1
 
-    def on_batch_begin(self, batch, logs=None):
-        if self.passed < self.params['steps']:
-            lr = (self.passed + 1.) / self.params['steps'] * self.learning_rate
-            K.set_value(self.train_model.optimizer.lr, lr)
-            self.passed += 1
-        elif self.params['steps'] <= self.passed < self.params['steps'] * 2:
-            lr = (2 - (self.passed + 1.) / self.params['steps']) * (self.learning_rate - self.min_learning_rate)
-            lr += self.min_learning_rate
-            K.set_value(self.train_model.optimizer.lr, lr)
-            self.passed += 1
+def build_model(bert_dir: str, relation_size: int, device: str):
+    model = TDEER(bert_dir, relation_size).to(device)
+    return model
 
-    def on_epoch_end(self, epoch, logs=None):
-        precision, recall, f1 = compute_metrics(self.infer, self.dev_data, exact_match=self.is_exact_match, model_name=self.model_name)
-        if f1 > self.best:
-            self.best = f1
-            self.train_model.save_weights(self.save_weights_path)
-            print("new best result!")
-        print('f1: %.4f, precision: %.4f, recall: %.4f, best f1: %.4f\n' % (f1, precision, recall, self.best))
+def get_optimizer(model: nn.Module, learning_rate: float):
+    return torch.optim.Adam(model.parameters(), lr=learning_rate)

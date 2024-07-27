@@ -1,5 +1,0 @@
--r requirements.txt
-setuptools
-pytest
-pytest-cov
-pytest-sugar
