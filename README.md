@@ -45,126 +45,25 @@ Click 👉[BERT-Base-Cased](https://storage.googleapis.com/bert_models/2018_10_1
 
 ### 4. Train & Eval
 
-You can use `run.py` with `--do_train` to train the model. After training, you can also use `run.py` with `--do_test` to evaluate data.
+we have already refactor this code to pytorch version, you could download the pretrain model directly from [huggingface](https://huggingface.co/bert-base-cased/tree/main).
 
-Our training and evaluating commands are as follows:
 
-1\. NYT
+if you want to fast vaild the code 
 
-train:
+please excuete the following command:
 
-```bash
-CUDA_VISIBLE_DEVICES=0 nohup python -u run.py \
---do_train \
---model_name NYT \
---rel_path data/NYT/rel2id.json \
---train_path data/NYT/train_triples.json \
---dev_path data/NYT/test_triples.json \
---bert_dir pretrained-bert/cased_L-12_H-768_A-12 \
---save_path ckpts/nyt.model \
---learning_rate 0.00005 \
---neg_samples 2 \
---epoch 200 \
---verbose 2 > nyt.log &
-```
-
-evaluate:
-
-```
-CUDA_VISIBLE_DEVICES=0 python run.py \
---do_test \
---model_name NYT \
---rel_path data/NYT/rel2id.json \
---test_path data/NYT/test_triples.json \
---bert_dir pretrained-bert/cased_L-12_H-768_A-12 \
---ckpt_path ckpts/nyt.model \
---max_len 512 \
---verbose 1
-```
-
-You can evaluate other data by specifying `--test_path`.
-
-2\. WebNLG
-
-train:
+#### for training
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 nohup python -u run.py \
---do_train \
---model_name WebNLG \
---rel_path data/WebNLG/rel2id.json \
---train_path data/WebNLG/train_triples.json \
---dev_path data/WebNLG/test_triples.json \
---bert_dir pretrained-bert/cased_L-12_H-768_A-12 \
---save_path ckpts/webnlg.model \
---max_sample_triples 5 \
---neg_samples 5 \
---learning_rate 0.00005 \
---epoch 300 \
---verbose 2 > webnlg.log &
+
+python run.py --do_train --model_name NYT_quick_test --rel_path data/data/NYT/rel2id.json --train_path data/data/NYT/train_triples.json --dev_path data/data/NYT/test_triples.json --bert_model bert-base-cased --save_path ckpts/nyt_quick_test.model --learning_rate 0.00005 --neg_samples 2 --epoch 5 --batch_size 32 --max_len 120 --max_sample_triples 100 --eval_steps 100 --num_workers 4 --use_amp --subset_size 1000
 ```
 
-evaluate:
+#### for testing
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python run.py \
---do_test \
---model_name WebNLG \
---rel_path data/WebNLG/rel2id.json \
---test_path data/WebNLG/test_triples.json \
---bert_dir pretrained-bert/cased_L-12_H-768_A-12 \
---ckpt_path ckpts/webnlg.model \
---max_len 512 \
---verbose 1
+python run.py --do_test --model_name NYT_full_test --rel_path data/data/NYT/rel2id.json --test_path data/data/NYT/test_triples.json --bert_model bert-base-cased --ckpt_path ckpts/nyt_full_train.model --batch_size 32 --max_len 120
 ```
-
-You can evaluate other data by specifying `--test_path`.
-
-
-3\. NYT11-HRL
-
-train:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 nohup python -u run.py \
---do_train \
---model_name NYT11-HRL \
---rel_path data/NYT11-HRL/rel2id.json \
---train_path data/NYT11-HRL/train_triples.json \
---dev_path data/NYT11-HRL/test_triples.json \
---bert_dir pretrained-bert/cased_L-12_H-768_A-12 \
---save_path ckpts/nyt11hrl.model \
---learning_rate 0.00005 \
---neg_samples 1 \
---epoch 100 \
---verbose 2 > nyt11hrl.log &
-```
-
-evaluate:
-
-```
-CUDA_VISIBLE_DEVICES=0 python run.py \
---do_test \
---model_name NYT11-HRL \
---rel_path data/NYT/rel2id.json \
---test_path data/NYT11-HRL/test_triples.json \
---bert_dir pretrained-bert/cased_L-12_H-768_A-12 \
---ckpt_path ckpts/nyt11hrl.model \
---max_len 512 \
---verbose 1
-```
-
-
-### Pre-trained Models
-
-We released our pre-trained models for NYT, WebNLG, and NYT11-HRL datasets, and uploaded them to this repository via git-lfs.
-
-You can download pre-trained models and then decompress them (`ckpts.zip`) to the `ckpts` folder.
-
-To use the pre-trained models, you need to download our processed datasets and specify `--rel_path` to our processed `rel2id.json`.
-
-To evaluate by the pre-trained models, you can use above commands and specify `--ckpt_path` to specific model.
-
 
 In our setting, NYT, WebNLG, and NYT11-HRL achieve the best result on Epoch 86, 174, and 23 respectively.
 
